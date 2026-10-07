@@ -17,4 +17,5 @@ class UserModel(Base):
     bananes: Mapped[int] = mapped_column()
     name: Mapped[str] = mapped_column()
     mail: Mapped[str] = mapped_column(unique=True)
+    hashed_password: Mapped[str] = mapped_column()
 

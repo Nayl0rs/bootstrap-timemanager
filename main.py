@@ -4,31 +4,52 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-# "database" et "models" sont nos propres fichiers (database.py et models.py, dans le même dossier).
-# engine = la connexion à PostgreSQL ; get_db = la fonction qui fournit une session par requête.
-# Base = le registre de tous les modèles SQLAlchemy ; UserModel = la classe de la table "users".
+# "database", "models" et "security" sont nos propres fichiers (dans le même dossier).
+# get_db = la fonction qui fournit une session de base de données par requête.
+# UserModel = la classe SQLAlchemy de la table "users" (voir models.py).
+# hash_password = transforme un mot de passe en hash (voir security.py).
 from database import get_db
 from models import UserModel
 
-# --- schémas Pydantic : ce qui circule sur le réseau (JSON), PAS ce qui est dans la base ---
+from security import hash_password
 
-# classe des données envoyées par le client pour créer/modifier un user. est un "BaseModel" de
-# pydantic ; cela permet plusieurs choses, comme la validation des types (python ignore les types
-# au runtime), la conversion du JSON reçu en objet (et inversement), etc..
+# --- les 4 classes d'un user : qui est envoyé à qui, et à quoi ça sert ---
+#
+#   client  --JSON-->  API (FastAPI)  --SQL-->  PostgreSQL
+#
+#   UserCreate  : client -> API. le JSON reçu pour CRÉER un user (POST). contient "password".
+#   UserBase    : client -> API. le JSON reçu pour MODIFIER un user (PUT). pas de password.
+#   User        : API -> client. le JSON renvoyé dans les réponses. contient l'id, jamais le password.
+#   UserModel   : API <-> base. PAS du JSON : la ligne de la table "users" (dans models.py).
+#                 contient "hashed_password", jamais le mot de passe en clair.
+#
+# les 3 premières sont des schémas Pydantic : ils décrivent ce qui circule sur le réseau
+# (JSON) et sont vérifiés automatiquement. UserModel décrit ce qui est stocké dans la base.
+# c'est pour ça qu'ils sont séparés : le client ne voit pas tout ce qu'il y a dans la base,
+# et il ne peut pas imposer certains champs (l'id, le hash).
+
+# champs communs à tous les schémas. ne sert pas directement dans une route, sauf pour le PUT.
+# est un "BaseModel" de pydantic ; cela permet plusieurs choses, comme la validation des types
+# (python ignore les types au runtime), la conversion du JSON reçu en objet (et inversement), etc..
 # si le client envoie un JSON invalide (ex: "bananes": "abc"), FastAPI renvoie automatiquement
 # une erreur 422 sans même appeler notre fonction.
-class UserCreate(BaseModel):
+class UserBase(BaseModel):
     bananes: int
     name: str
     mail: str
 
-# classe qui hérite de "UserCreate". le but est de mettre l'id dans cette classe et pas
-# dans UserCreate pour éviter que le client puisse désigner l'id lorsqu'il crée un user.
-# on désigne également "response_model=User" si l'on souhaite montrer l'id dans la réponse.
+# ce que le client envoie pour créer un user (POST /users) : les champs de UserBase + le password
+# en clair. il n'est jamais stocké ni renvoyé : create_user le transforme en hash, puis l'oublie.
+# pas d'id ici : c'est la base qui le génère, le client ne peut pas le choisir.
+class UserCreate(UserBase):
+    password: str
+
+# ce que l'API renvoie au client (response_model=User) : les champs de UserBase + l'id.
+# pas de password ici, donc impossible de le renvoyer par erreur (même le hash).
 # from_attributes=True : par défaut, pydantic sait lire des dict (obj["name"]) mais pas des objets
 # quelconques. avec cette option, il lit aussi les attributs (obj.name), ce qui lui permet de
 # convertir un UserModel (objet SQLAlchemy renvoyé par la base) en User (JSON de la réponse).
-class User(UserCreate):
+class User(UserBase):
     id: int
     model_config = ConfigDict(from_attributes=True)
 
@@ -46,8 +67,8 @@ app = FastAPI()
 # représente le path (la partie de l'url après le domaine). la fonction en dessous est appelée
 # automatiquement par FastAPI lorsqu'une requête GET arrive sur ce path. response_model permet de
 # choisir les champs renvoyés au client ; ici, ça montre tous les champs de tous les utilisateurs,
-# y compris l'id. si on voulait cacher l'id, on mettrait "UserCreate" à la place (car id est
-# dans User qui hérite de UserCreate).
+# y compris l'id (mais jamais le password, car User n'a pas ce champ). si on voulait cacher l'id,
+# on mettrait "UserBase" à la place (car id est dans User qui hérite de UserBase).
 #
 # db: Session = Depends(get_db) : FastAPI appelle get_db() avant la fonction et nous donne la
 # session dans "db" (une session = une "conversation" avec la base, propre à cette requête).
@@ -75,12 +96,16 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="user not found")
     return result
 
-# 200 -> 299 = success responses. en HTTP, le code 201 correspond à "Created". la fonction
-# retourne l'user qui a été créé avec l'id (car User et non UserCreate).
+# 200 -> 299 = success responses. en HTTP, le code 201 correspond à "Created".
+# entrée : le client envoie un "UserCreate" (avec le password en clair). sortie : la fonction
+# retourne l'user créé sous forme de "User" (avec l'id, sans password, grâce à response_model).
 # l'id n'est plus calculé par nous : PostgreSQL le génère tout seul (clé primaire auto-incrémentée).
 #
 # item.model_dump() est une méthode de Pydantic qui convertit une instance de BaseModel
-# en dictionnaire python. le ** qui vient avant "déballe" ce dictionnaire : ses paires
+# en dictionnaire python. exclude={"password"} retire le mot de passe en clair du dictionnaire :
+# la table n'a pas de colonne "password", seulement "hashed_password", qu'on remplit
+# avec hash_password(item.password) (le hash, pas le mot de passe).
+# le ** qui vient avant "déballe" ce dictionnaire : ses paires
 # clé/valeur deviennent des arguments nommés, donc UserModel(**{"name": "a", ...}) revient à
 # UserModel(name="a", ...) sans avoir à les réécrire à la main.
 #
@@ -97,7 +122,8 @@ def get_user(user_id: int, db: Session = Depends(get_db)):
 # l'id généré par PostgreSQL.
 @app.post("/users", status_code=201, response_model=User)
 def create_user(item: UserCreate, db: Session = Depends(get_db)):
-    db_user = UserModel(**item.model_dump())
+    data = item.model_dump(exclude={"password"})
+    db_user = UserModel(**data, hashed_password=hash_password(item.password))
     try:
         db.add(db_user)
         db.commit()
@@ -108,17 +134,19 @@ def create_user(item: UserCreate, db: Session = Depends(get_db)):
     db.refresh(db_user)
     return db_user
 
+# entrée : le client envoie un "UserBase" (et non UserCreate) : bananes, name et mail, sans password.
+# le PUT ne peut donc pas changer le mot de passe. sortie : l'user modifié, sous forme de "User".
 # on récupère l'user en base (404 s'il n'existe pas), puis on remplace tous ses champs par ceux
 # du client. user.model_dump().items() donne des paires (clé, valeur), comme ("name", "carl") ;
 # setattr(objet, "name", "carl") fait la même chose que objet.name = "carl", mais avec un nom
 # d'attribut dynamique, donc une boucle suffit pour les copier tous. l'id, lui, ne change pas
-# (il vient de l'URL et n'est pas dans UserCreate).
+# (il vient de l'URL et n'est pas dans UserBase).
 # les modifications ne sont enregistrées qu'au db.commit(). comme pour le POST, changer le mail
 # vers un mail déjà utilisé par quelqu'un d'autre provoque une IntegrityError, d'où le même
 # try/except (rollback + 409).
 # si on voulait mettre à jour seulement UNE valeur, on utiliserait l'opération PATCH.
 @app.put("/users/{user_id}", response_model=User)
-def update_user(user_id: int, user: UserCreate, db: Session = Depends(get_db)):
+def update_user(user_id: int, user: UserBase, db: Session = Depends(get_db)):
     db_user = db.get(UserModel, user_id)
     if db_user is None:
         raise HTTPException(status_code=404, detail="user not found")
