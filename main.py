@@ -4,6 +4,16 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
+
+# c'est CETTE ligne qui fait apparaître le bouton "Authorize" (et les cadenas) dans /docs :
+# FastAPI voit que des routes dépendent de oauth2_scheme et ajoute le schéma de sécurité à la doc.
+# oauth2_scheme est un objet "appelable" utilisé avec Depends(oauth2_scheme) : il lit le header
+# "Authorization: Bearer <token>" de la requête et renvoie juste la chaîne du token (sans "Bearer").
+# s'il n'y a pas de header, il renvoie lui-même une 401 "Not authenticated" sans appeler la route.
+# tokenUrl="login" = l'adresse de la route de login, que /docs appelle quand on clique sur "Authorize".
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
 # "database", "models" et "security" sont nos propres fichiers (dans le même dossier).
 # get_db = la fonction qui fournit une session de base de données par requête.
 # UserModel = la classe SQLAlchemy de la table "users" (voir models.py).
@@ -11,7 +21,8 @@ from sqlalchemy.exc import IntegrityError
 from database import get_db
 from models import UserModel
 
-from security import hash_password
+from security import hash_password, verify_password, create_access_token, create_refresh_token, decode_token
+import jwt
 
 # --- les 4 classes d'un user : qui est envoyé à qui, et à quoi ça sert ---
 #
@@ -53,6 +64,31 @@ class User(UserBase):
     id: int
     model_config = ConfigDict(from_attributes=True)
 
+# ce que /login renvoie (response_model=Token). BaseModel = c'est un schéma Pydantic, comme User :
+# FastAPI s'en sert pour valider et mettre en JSON la réponse.
+# "access_token" et "token_type" sont les noms imposés par le standard OAuth2 : les clients (et /docs)
+# les cherchent sous ces noms exacts. "refresh_token" est un champ optionnel du même standard.
+class Token(BaseModel):
+    access_token: str   # courte durée (15 min) : envoyé avec chaque requête
+    refresh_token: str  # longue durée (7 jours) : sert seulement à obtenir un nouvel access_token
+    token_type: str = "bearer"  # valeur par défaut : remplie automatiquement. dit au client d'envoyer "Authorization: Bearer <token>"
+
+
+# ce que le client envoie à /refresh : un corps JSON {"refresh_token": "..."}.
+# (contrairement à /login qui reçoit un formulaire, /refresh reçoit du JSON : Pydantic le valide tout seul)
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+# l'erreur 401 réutilisée partout (get_current_user et /refresh) : un seul message, quelle que soit
+# la raison de l'échec (token invalide, expiré, mauvais type, user supprimé), pour ne rien révéler
+# à un attaquant. le header "WWW-Authenticate: Bearer" est requis par le standard HTTP pour une 401 :
+# il dit au client quel type d'authentification utiliser. définie ici, avant son premier usage.
+credentials_error = HTTPException(
+    status_code=401,
+    detail="Invalid or expired token",
+    headers={"WWW-Authenticate": "Bearer"}
+)
+
 # l'app est une instance de la classe FastAPI
 app = FastAPI()
 
@@ -63,12 +99,34 @@ app = FastAPI()
 # ^ commented because from now on, alembic is the only thing that creates & changes tables.
 
 
+# "dépendance" qui identifie l'utilisateur connecté à partir du token. FastAPI l'exécute AVANT
+# toute route qui la déclare avec Depends(get_current_user) : si elle lève une erreur, la route
+# n'est jamais appelée. si tout va bien, elle renvoie le UserModel de la personne connectée.
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> UserModel:
+    # token = la chaîne extraite du header "Authorization: Bearer ..." par oauth2_scheme
+    try:
+        payload = decode_token(token)  # vérifie la signature ET la date d'expiration, renvoie les claims (dict)
+    except jwt.InvalidTokenError:  # token modifié, mal formé ou expiré (ExpiredSignatureError en est une sous-classe)
+        raise credentials_error
+    token_type = payload["type"]  # "access" ou "refresh" (le claim qu'on a mis dans create_token)
+
+    if token_type != "access":  # empêche d'utiliser un refresh token (7 jours) comme access token
+        raise credentials_error
+    user_id = int(payload["sub"])  # "sub" = subject = l'id de l'user. attention : c'est une CHAÎNE ("3"), pas un int
+    user = db.get(UserModel, user_id)  # le token est valide, mais l'user existe-t-il encore en base ?
+    if user is None:  # token valide mais user supprimé depuis : on refuse quand même
+        raise credentials_error
+    return user
+
 # @app.get(...) = décorateur. le get fait référence à la méthode HTTP GET (opération). le "/users"
 # représente le path (la partie de l'url après le domaine). la fonction en dessous est appelée
 # automatiquement par FastAPI lorsqu'une requête GET arrive sur ce path. response_model permet de
 # choisir les champs renvoyés au client ; ici, ça montre tous les champs de tous les utilisateurs,
 # y compris l'id (mais jamais le password, car User n'a pas ce champ). si on voulait cacher l'id,
 # on mettrait "UserBase" à la place (car id est dans User qui hérite de UserBase).
+#
+# dependencies=[Depends(get_current_user)] : la route exige un token valide (sinon 401). on le met
+# dans le décorateur quand la route n'a pas besoin de l'user lui-même, juste de la vérification.
 #
 # db: Session = Depends(get_db) : FastAPI appelle get_db() avant la fonction et nous donne la
 # session dans "db" (une session = une "conversation" avec la base, propre à cette requête).
@@ -79,7 +137,7 @@ app = FastAPI()
 #
 # select(UserModel) = l'équivalent de "SELECT * FROM users". db.scalars(...) l'exécute et
 # renvoie des objets UserModel (et non des lignes brutes). .all() les met dans une liste python.
-@app.get("/users", response_model=list[User])
+@app.get("/users", response_model=list[User], dependencies=[Depends(get_current_user)])
 def get_users(db: Session = Depends(get_db)):
     return db.scalars(select(UserModel)).all()
 
@@ -89,7 +147,7 @@ def get_users(db: Session = Depends(get_db)):
 # si on ne trouve rien, on renvoie une erreur HTTP avec code 404 pour not found. le "raise"
 # arrête la fonction, donc le "return" n'est atteint que si l'user existe.
 # ("is None" et non "== None" : None est un objet unique, on compare l'identité.)
-@app.get("/users/{user_id}", response_model=User)
+@app.get("/users/{user_id}", response_model=User, dependencies=[Depends(get_current_user)])
 def get_user(user_id: int, db: Session = Depends(get_db)):
     result = db.get(UserModel, user_id)
     if result is None:
@@ -145,7 +203,7 @@ def create_user(item: UserCreate, db: Session = Depends(get_db)):
 # vers un mail déjà utilisé par quelqu'un d'autre provoque une IntegrityError, d'où le même
 # try/except (rollback + 409).
 # si on voulait mettre à jour seulement UNE valeur, on utiliserait l'opération PATCH.
-@app.put("/users/{user_id}", response_model=User)
+@app.put("/users/{user_id}", response_model=User, dependencies=[Depends(get_current_user)])
 def update_user(user_id: int, user: UserBase, db: Session = Depends(get_db)):
     db_user = db.get(UserModel, user_id)
     if db_user is None:
@@ -167,7 +225,7 @@ def update_user(user_id: int, user: UserBase, db: Session = Depends(get_db)):
 # n'existe plus, il n'y a rien à recharger. le code 204 = "No Content" : la réponse n'a pas de
 # corps, c'est la convention REST pour un DELETE réussi. le return met fin à la fonction
 # (None, donc pas de corps).
-@app.delete("/users/{user_id}", status_code=204)
+@app.delete("/users/{user_id}", status_code=204, dependencies=[Depends(get_current_user)])
 def delete_user(user_id: int, db: Session = Depends(get_db)):
     u = db.get(UserModel, user_id)
     if u is None:
@@ -175,3 +233,48 @@ def delete_user(user_id: int, db: Session = Depends(get_db)):
     db.delete(u)
     db.commit()
     return
+
+@app.post("/login", response_model=Token)
+# OAuth2PasswordRequestForm : lit un FORMULAIRE (pas du JSON) avec deux champs imposés par le standard,
+# "username" et "password". comme nos comptes s'identifient par mail, le mail va dans "username".
+def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    # db.get ne cherche que par id ; ici on n'a que le mail, donc select + where. db.scalar = 1er résultat ou None
+    user = db.scalar(select(UserModel).where(UserModel.mail == form.username))
+    # même message pour "mail inconnu" et "mauvais mot de passe" : on ne dit pas à un attaquant quels mails existent.
+    # "or" s'arrête au 1er True : si user est None, user.hashed_password n'est jamais lu (pas d'erreur).
+    if user is None or not verify_password(form.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Wrong username or password")
+
+    refresh_token = create_refresh_token(user_id=user.id)
+    access_token = create_access_token(user_id=user.id)
+    return Token(access_token=access_token, refresh_token=refresh_token)  # token_type prend sa valeur par défaut "bearer"
+
+# route de test : renvoie l'user connecté. current_user est ce que get_current_user a renvoyé ;
+# ici on déclare la dépendance comme paramètre (et non dans le décorateur) car on a besoin de l'user.
+@app.get("/me", response_model=User)
+def read_me(current_user: UserModel = Depends(get_current_user)) -> UserModel:
+    return current_user
+
+# appelée par le CLIENT (le front), automatiquement, quand l'access token (15 min) a expiré :
+# il envoie son refresh token (7 jours) et reçoit une nouvelle paire de tokens, sans retaper son
+# mot de passe. route PUBLIQUE (pas de Depends(get_current_user)) : à ce moment-là, le client n'a
+# justement plus d'access token valide. sans le try/except, un token invalide ou expiré
+# donnerait une 500 au lieu d'une 401.
+@app.post("/refresh", response_model=Token)
+def refresh_token(request_body: RefreshRequest, db: Session = Depends(get_db)) -> Token:
+    try:
+        payload = decode_token(request_body.refresh_token)  # vérifie signature + expiration
+    except jwt.InvalidTokenError:
+        raise credentials_error
+
+    if payload["type"] != "refresh":  # l'inverse de get_current_user : ici on refuse les access tokens
+        raise credentials_error
+    user = db.get(UserModel, int(payload["sub"]))  # "sub" est une chaîne -> int pour chercher par id
+    if user is None:  # user supprimé depuis : plus de refresh possible
+        raise credentials_error
+
+    # on émet une NOUVELLE paire (rotation). attention : les tokens sont "stateless" (rien n'est
+    # stocké côté serveur), donc l'ancien refresh token reste valide jusqu'à son expiration.
+    new_refresh_token = create_refresh_token(user.id)
+    new_access_token = create_access_token(user.id)
+    return Token(access_token=new_access_token, refresh_token=new_refresh_token)
